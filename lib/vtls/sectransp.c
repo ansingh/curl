@@ -32,6 +32,7 @@
 #include "curl_base64.h"
 #include "strtok.h"
 #include "multiif.h"
+#include "x509asn1.h"
 
 #ifdef USE_SECTRANSP
 
@@ -2708,20 +2709,21 @@ sectransp_connect_step2(struct connectdata *conn, int sockindex)
   }
 }
 
-#ifndef CURL_DISABLE_VERBOSE_STRINGS
+typedef bool(*Read_crt_func)(const SecCertificateRef server_cert,
+                             CFIndex idx, CFIndex count, void *arg);
+
 /* This should be called during step3 of the connection at the earliest */
 static void
-show_verbose_server_cert(struct connectdata *conn,
-                         int sockindex)
+traverse_cert_store(struct ssl_connect_data *connssl, Read_crt_func func,
+                    void *arg)
 {
-  struct Curl_easy *data = conn->data;
-  struct ssl_connect_data *connssl = &conn->ssl[sockindex];
   struct ssl_backend_data *backend = connssl->backend;
   CFArrayRef server_certs = NULL;
   SecCertificateRef server_cert;
   OSStatus err;
   CFIndex i, count;
   SecTrustRef trust = NULL;
+  bool should_continue = true;
 
   if(!backend->ssl_ctx)
     return;
@@ -2734,15 +2736,9 @@ show_verbose_server_cert(struct connectdata *conn,
      a null trust, so be on guard for that: */
   if(err == noErr && trust) {
     count = SecTrustGetCertificateCount(trust);
-    for(i = 0L ; i < count ; i++) {
-      CURLcode result;
-      char *certp;
+    for(i = 0L ; i < count && should_continue ; i++) {
       server_cert = SecTrustGetCertificateAtIndex(trust, i);
-      result = CopyCertSubject(data, server_cert, &certp);
-      if(!result) {
-        infof(data, "Server certificate: %s\n", certp);
-        free(certp);
-      }
+      should_continue = func(server_cert, i, count, arg);
     }
     CFRelease(trust);
   }
@@ -2760,15 +2756,9 @@ show_verbose_server_cert(struct connectdata *conn,
        a null trust, so be on guard for that: */
     if(err == noErr && trust) {
       count = SecTrustGetCertificateCount(trust);
-      for(i = 0L ; i < count ; i++) {
-        char *certp;
-        CURLcode result;
+      for(i = 0L ; i < count && should_continue ; i++) {
         server_cert = SecTrustGetCertificateAtIndex(trust, i);
-        result = CopyCertSubject(data, server_cert, &certp);
-        if(!result) {
-          infof(data, "Server certificate: %s\n", certp);
-          free(certp);
-        }
+        should_continue = func(server_cert, i, count, arg);
       }
       CFRelease(trust);
     }
@@ -2779,16 +2769,10 @@ show_verbose_server_cert(struct connectdata *conn,
     /* Just in case SSLCopyPeerCertificates() returns null too... */
     if(err == noErr && server_certs) {
       count = CFArrayGetCount(server_certs);
-      for(i = 0L ; i < count ; i++) {
-        char *certp;
-        CURLcode result;
+      for(i = 0L ; i < count && should_continue ; i++) {
         server_cert = (SecCertificateRef)CFArrayGetValueAtIndex(server_certs,
                                                                 i);
-        result = CopyCertSubject(data, server_cert, &certp);
-        if(!result) {
-          infof(data, "Server certificate: %s\n", certp);
-          free(certp);
-        }
+        should_continue = func(server_cert, i, count, arg);
       }
       CFRelease(server_certs);
     }
@@ -2800,19 +2784,58 @@ show_verbose_server_cert(struct connectdata *conn,
   err = SSLCopyPeerCertificates(backend->ssl_ctx, &server_certs);
   if(err == noErr) {
     count = CFArrayGetCount(server_certs);
-    for(i = 0L ; i < count ; i++) {
-      CURLcode result;
-      char *certp;
+    for(i = 0L ; i < count && should_continue ; i++) {
       server_cert = (SecCertificateRef)CFArrayGetValueAtIndex(server_certs, i);
-      result = CopyCertSubject(data, server_cert, &certp);
-      if(!result) {
-        infof(data, "Server certificate: %s\n", certp);
-        free(certp);
-      }
+      should_continue = func(server_cert, i, count, arg);
     }
     CFRelease(server_certs);
   }
 #endif /* CURL_BUILD_MAC_10_7 || CURL_BUILD_IOS */
+}
+
+struct Adder_args
+{
+  struct connectdata *conn;
+  CURLcode result;
+};
+
+static bool
+add_cert_to_certinfo(const SecCertificateRef server_cert, CFIndex idx,
+                     CFIndex count, void *raw_arg)
+{
+  struct Adder_args *args = (struct Adder_args*)raw_arg;
+  args->result = CURLE_OK;
+
+  if(idx == 0) {
+    args->result = Curl_ssl_init_certinfo(args->conn->data, (int)count);
+  }
+
+  if(args->result == CURLE_OK && server_cert) {
+    CFDataRef cert_data = SecCertificateCopyData(server_cert);
+    char *beg = (char *)CFDataGetBytePtr(cert_data);
+    char *end = beg + CFDataGetLength(cert_data);
+    args->result = Curl_extract_certinfo(args->conn, (int)idx, beg, end);
+    CFRelease(cert_data);
+  }
+  return args->result == CURLE_OK;
+}
+
+#ifndef CURL_DISABLE_VERBOSE_STRINGS
+
+static bool
+show_verbose_server_cert(const SecCertificateRef server_cert, CFIndex idx,
+                         CFIndex count, void *raw_arg)
+{
+#pragma unused(idx)
+#pragma unused(count)
+  struct Curl_easy *data = (struct Curl_easy *)raw_arg;
+  char *certp = NULL;
+  CURLcode result = CopyCertSubject(data, server_cert, &certp);
+  if(!result) {
+    infof(data, "Server certificate: %s\n", certp);
+    free(certp);
+  }
+  return TRUE;
 }
 #endif /* !CURL_DISABLE_VERBOSE_STRINGS */
 
@@ -2828,8 +2851,16 @@ sectransp_connect_step3(struct connectdata *conn,
    * server certificates. */
 #ifndef CURL_DISABLE_VERBOSE_STRINGS
   if(data->set.verbose)
-    show_verbose_server_cert(conn, sockindex);
+    traverse_cert_store(connssl, show_verbose_server_cert, data);
 #endif
+
+  if(data->set.ssl.certinfo) {
+    struct Adder_args args;
+    args.conn = conn;
+    traverse_cert_store(connssl, add_cert_to_certinfo, &args);
+    if(args.result)
+      return args.result;
+  }
 
   connssl->connecting_state = ssl_connect_done;
   return CURLE_OK;
@@ -3290,10 +3321,9 @@ const struct Curl_ssl Curl_ssl_sectransp = {
   { CURLSSLBACKEND_SECURETRANSPORT, "secure-transport" }, /* info */
 
 #ifdef SECTRANSP_PINNEDPUBKEY
-  SSLSUPP_PINNEDPUBKEY,
-#else
-  0,
+  SSLSUPP_PINNEDPUBKEY |
 #endif /* SECTRANSP_PINNEDPUBKEY */
+  SSLSUPP_CERTINFO,
 
   sizeof(struct ssl_backend_data),
 

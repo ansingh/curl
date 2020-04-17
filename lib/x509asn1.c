@@ -23,7 +23,7 @@
 #include "curl_setup.h"
 
 #if defined(USE_GSKIT) || defined(USE_NSS) || defined(USE_GNUTLS) || \
-    defined(USE_WOLFSSL) || defined(USE_SCHANNEL)
+    defined(USE_WOLFSSL) || defined(USE_SCHANNEL) || defined(USE_SECTRANSP)
 
 #include <curl/curl.h>
 #include "urldata.h"
