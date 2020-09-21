@@ -87,8 +87,28 @@ CURLcode Curl_pp_statemach(struct pingpong *pp, bool block,
   timediff_t timeout_ms = Curl_pp_state_timeout(pp, disconnecting);
   struct Curl_easy *data = conn->data;
   CURLcode result = CURLE_OK;
+  char *ptr;
 
   if(timeout_ms <= 0) {
+    ptr = conn->data->state.buffer + pp->nread_resp;
+    /* dump everything in data buffer before we timeout */
+    if(pp->linestart_resp < ptr) {
+#ifdef HAVE_GSSAPI
+      if(!conn->sec_complete)
+#endif
+        if(data->set.verbose)
+          Curl_debug(data, CURLINFO_HEADER_IN,
+                     pp->linestart_resp + pp->headerskip_resp,
+                     (size_t)(ptr - pp->linestart_resp) - pp->headerskip_resp);
+
+      result = Curl_client_write(conn, CLIENTWRITE_HEADER,
+                                 pp->linestart_resp + pp->headerskip_resp,
+                                 (size_t)(ptr - pp->linestart_resp) -
+                                 pp->headerskip_resp);
+      if(!result)
+        pp->headerskip_resp = (size_t)(ptr - pp->linestart_resp);
+    }
+
     failf(data, "server response timeout");
     return CURLE_OPERATION_TIMEDOUT; /* already too little time */
   }
@@ -142,6 +162,7 @@ void Curl_pp_init(struct pingpong *pp)
   struct connectdata *conn = pp->conn;
   pp->nread_resp = 0;
   pp->linestart_resp = conn->data->state.buffer;
+  pp->headerskip_resp = 0;
   pp->pending_resp = TRUE;
   pp->response = Curl_now(); /* start response time-out now! */
 }
@@ -360,13 +381,18 @@ CURLcode Curl_pp_readresp(curl_socket_t sockfd,
           /* a newline is CRLF in pp-talk, so the CR is ignored as
              the line isn't really terminated until the LF comes */
 
+          /* line length should always be more than what we chose to
+             keep from this line after truncation */
+          DEBUGASSERT((size_t)perline > pp->headerskip_resp);
+
           /* output debug output if that is requested */
 #ifdef HAVE_GSSAPI
           if(!conn->sec_complete)
 #endif
             if(data->set.verbose)
               Curl_debug(data, CURLINFO_HEADER_IN,
-                         pp->linestart_resp, (size_t)perline);
+                         pp->linestart_resp + pp->headerskip_resp,
+                         (size_t)(perline - pp->headerskip_resp));
 
           /*
            * We pass all response-lines to the callback function registered
@@ -374,10 +400,12 @@ CURLcode Curl_pp_readresp(curl_socket_t sockfd,
            * headers.
            */
           result = Curl_client_write(conn, CLIENTWRITE_HEADER,
-                                     pp->linestart_resp, perline);
+                                     pp->linestart_resp + pp->headerskip_resp,
+                                     perline - pp->headerskip_resp);
           if(result)
             return result;
 
+          pp->headerskip_resp = 0;
           if(pp->endofresp(conn, pp->linestart_resp, perline, code)) {
             /* This is the end of the last line, copy the last line to the
                start of the buffer and null-terminate, for old times sake */
@@ -421,11 +449,31 @@ CURLcode Curl_pp_readresp(curl_socket_t sockfd,
           /* we keep 40 bytes since all our pingpong protocols are only
              interested in the first piece */
           clipamount = 40;
+
+          /* we still have to ensure we write all data in headers,
+            this is needed to facilitate the handling of this truncated data
+            if the client desires */
+#ifdef HAVE_GSSAPI
+          if(!conn->sec_complete)
+#endif
+            if(data->set.verbose)
+              Curl_debug(data, CURLINFO_HEADER_IN,
+                         pp->linestart_resp + pp->headerskip_resp,
+                         (size_t)(perline - pp->headerskip_resp));
+
+          result = Curl_client_write(conn, CLIENTWRITE_HEADER,
+                                     pp->linestart_resp + pp->headerskip_resp,
+                                     perline - pp->headerskip_resp);
+
+          /* the clipped amount needs to be skipped when we write the rest */
+          if(!result)
+            pp->headerskip_resp = clipamount;
         }
         else if(pp->nread_resp > (size_t)data->set.buffer_size/2) {
           /* We got a large chunk of data and there's potentially still
              trailing data to take care of, so we put any such part in the
-             "cache", clear the buffer to make space and restart. */
+             "cache", clear the buffer of lines already been written to make
+             space and restart. */
           clipamount = perline;
           restart = TRUE;
         }

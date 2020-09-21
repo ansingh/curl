@@ -49,6 +49,8 @@ struct pingpong {
   char *cache;     /* data cache between getresponse()-calls */
   size_t cache_size;  /* size of cache in bytes */
   size_t nread_resp;  /* number of bytes currently read of a server response */
+  size_t headerskip_resp; /* number of bytes in the current response line
+                             already been written due to line truncation */
   char *linestart_resp; /* line start pointer for the server response
                            reader function */
   bool pending_resp;  /* set TRUE when a server response is pending or in
