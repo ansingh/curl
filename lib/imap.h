@@ -64,6 +64,7 @@ struct IMAP {
   char *query;            /* Query to search for */
   char *custom;           /* Custom request */
   char *custom_params;    /* Parameters for the custom request */
+  char *msgdate;         /* Attribute to fetch */
 };
 
 /* imap_conn is used for struct connection-oriented data in the connectdata

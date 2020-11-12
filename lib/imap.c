@@ -779,7 +779,11 @@ static CURLcode imap_perform_append(struct connectdata *conn)
     return CURLE_OUT_OF_MEMORY;
 
   /* Send the APPEND command */
-  result = imap_sendf(conn, "APPEND %s (\\Seen) {%" CURL_FORMAT_CURL_OFF_T "}",
+  if (imap->msgdate)
+    result = imap_sendf(conn, "APPEND %s (\\Seen) %s {%" CURL_FORMAT_CURL_OFF_T "}",
+                      mailbox, imap->msgdate, data->state.infilesize);
+  else
+    result = imap_sendf(conn, "APPEND %s (\\Seen) {%" CURL_FORMAT_CURL_OFF_T "}",
                       mailbox, data->state.infilesize);
 
   free(mailbox);
@@ -1504,6 +1508,7 @@ static CURLcode imap_done(struct connectdata *conn, CURLcode status,
   Curl_safefree(imap->query);
   Curl_safefree(imap->custom);
   Curl_safefree(imap->custom_params);
+  Curl_safefree(imap->msgdate);
 
   /* Clear the transfer mode for the next request */
   imap->transfer = FTPTRANSFER_BODY;
@@ -2039,6 +2044,13 @@ static CURLcode imap_parse_url_path(struct connectdata *conn)
         value[valuelen - 1] = '\0';
 
       imap->partial = value;
+      value = NULL;
+    }
+    else if(strcasecompare(name, "DATE") && !imap->msgdate) {
+      if(valuelen > 0 && value[valuelen - 1] == '/')
+        value[valuelen - 1] = '\0';
+
+      imap->msgdate = value;
       value = NULL;
     }
     else {
